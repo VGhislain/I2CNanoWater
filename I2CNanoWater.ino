@@ -35,6 +35,10 @@
 
 #define deviceId VGS_DEVICE_I2C_ADDR_WATER
 
+// Force EEPROM config re-initialization only when you intentionally want to erase and reset the stored settings.
+// Set this to 1 temporarily for a reset, then put it back to 0 for normal operation.
+#define FORCE_EEPROM_REINITIALIZATION 0
+
 
 template< typename T > void Serial_printf(char * text, T data ){
     Serial.print(text);
@@ -42,15 +46,15 @@ template< typename T > void Serial_printf(char * text, T data ){
   }
 
 struct VGSDeviceConfigStruct{
-  long iCounter;
-  long lWaterContainerEmptyWeight;
-  long lWaterContainerFullWeight;
-  int iWaterMode;        //action device mode 0:OFF, 1:ON, 2:Auto in auto mode, water pump running when cat is detected, ON : water pump running, OFF : water pump off
-  int iWaterFillLowPerc; //percentage below wich an alarm should be sent
-  int iWaterRecyclePerc; //percentage of time the pump should run
-  int iWaterCheckCatPresence; //flag to check the cat presence or not before activating the recycle
-  int iWaterDesiableAutoFill; //flag to disable the auto fill if the cat doesn't like when pump is running
-  int refData; //ref data to assure EEPROM is well saved - correct value is 12345
+  long iCounter = 0;
+  long lWaterContainerEmptyWeight = 0;
+  long lWaterContainerFullWeight = 0;
+  int iWaterMode = 0;        //action device mode 0:OFF, 1:ON, 2:Auto in auto mode, water pump running when cat is detected, ON : water pump running, OFF : water pump off
+  int iWaterFillLowPerc = 0; //percentage below wich an alarm should be sent
+  int iWaterRecyclePerc = 0; //percentage of time the pump should run
+  int iWaterCheckCatPresence = 0; //flag to check the cat presence or not before activating the recycle
+  int iWaterDesiableAutoFill = 0; //flag to disable the auto fill if the cat doesn't like when pump is running
+  int refData = VGS_CONFIG_REFDATA; //ref data to assure EEPROM is well saved - correct value is 12345
 };
 
 struct VGSDeviceSensorStruct{
@@ -63,6 +67,7 @@ struct VGSDeviceSensorStruct{
   int isCatPresent=0;  //value provided by the presense sensor -> disable if cat present in house
   unsigned long pumpLastOnTime;  //last time the pump was on
   unsigned long pumpLastOffTime; //last time the pump was off
+  unsigned long lastCatDetectionTime;
   unsigned long systemTime;
 };
 
@@ -87,6 +92,18 @@ unsigned long redLedBlinkDelay;
 unsigned long lastCommandMaxDelay;
 
 //--- device config ---
+void resetConfigToDefaults(){
+  deviceConfig.iCounter = 0;
+  deviceConfig.lWaterContainerEmptyWeight = 0;
+  deviceConfig.lWaterContainerFullWeight = 0;
+  deviceConfig.iWaterMode = 0;
+  deviceConfig.iWaterFillLowPerc = 0;
+  deviceConfig.iWaterRecyclePerc = 0;
+  deviceConfig.iWaterCheckCatPresence = 0;
+  deviceConfig.iWaterDesiableAutoFill = 0;
+  deviceConfig.refData = VGS_CONFIG_REFDATA;
+}
+
 void logConfig(){
   Serial.println("Dump of deviceConfig");
   Serial.println("[");
@@ -214,6 +231,7 @@ void requestEvent(int nbr) {
   if(iIndex==curItem++) {sprintf(i2cBuffer,"C %d",deviceConfig.iWaterMode); i2cBuffer[1]=VGS_CONFIG_WATER_MODE;};
   if(iIndex==curItem++) {sprintf(i2cBuffer,"S %d",deviceSensors.waterFillPercentage); i2cBuffer[1]=VGS_SENSOR_WATER_CONTAINER_P;};
   if(iIndex==curItem++) {sprintf(i2cBuffer,"S %d",deviceSensors.isCatDrinking); i2cBuffer[1]=VGS_SENSOR_CAT_DRINKING;};
+  if(iIndex==curItem++) {sprintf(i2cBuffer, "S %lu",deviceSensors.lastCatDetectionTime); i2cBuffer[1] = VGS_SENSOR_WATER_LAST_EATING_TIME;};
   if(iIndex==curItem++) {sprintf(i2cBuffer,"S %d",deviceSensors.waterFillLowAlarm); i2cBuffer[1]=VGS_SENSOR_WATER_CONTAINER_ALARM;};
   if(iIndex==curItem++) {sprintf(i2cBuffer,"C %d",deviceConfig.iWaterRecyclePerc); i2cBuffer[1]=VGS_CONFIG_WATER_RECYCLE_PERC;};
   if(iIndex==curItem++) {sprintf(i2cBuffer,"C %d",deviceConfig.iWaterCheckCatPresence); i2cBuffer[1]=VGS_CONFIG_WATER_RECYCLE_CHECK_PRESENCE;};
@@ -221,12 +239,14 @@ void requestEvent(int nbr) {
   if(iIndex==curItem++) {sprintf(i2cBuffer,"C %d",deviceConfig.iWaterFillLowPerc); i2cBuffer[1]=VGS_CONFIG_WATER_PERC_LOW;};
   if(iIndex==curItem++) {sprintf(i2cBuffer,"S %lu",deviceSensors.systemTime); i2cBuffer[1]=VGS_SENSOR_SYSTEM_TIME;};
    
+    
+
   Serial.print("Buffer sent to master : ");
   Serial.println(i2cBuffer);
 
   Wire.write(i2cBuffer);
   iIndex++;
-  if(iIndex==10) iIndex=0;
+  if(iIndex==11) iIndex=0;
 }
 
 //=====================================================================================================================================================================
@@ -239,14 +259,11 @@ void firstInitialization(){
       Serial.print(".");
       EEPROM.write(i, 0);
     }
-    deviceConfig.refData = VGS_CONFIG_REFDATA;
+    resetConfigToDefaults();
     saveConfig();
-    deviceConfig.refData = 99999;
-    readConfig();
     Serial_printf("deviceConfig.iCounter",deviceConfig.iCounter);
     Serial_printf("deviceConfig.refData",deviceConfig.refData);
-    Serial.println("\nInitialization done ! please check if config refData is well defined - should be <> 99999");
-    while(1) delay(1000);
+    Serial.println("\nInitialization done !");
 }
 
 void saveConfig(){
@@ -260,8 +277,16 @@ void readConfig(){
 }
 
 boolean isInitialized(){
-    if(deviceConfig.refData==VGS_CONFIG_REFDATA) return true;
-    else return false;
+    if(deviceConfig.refData!=VGS_CONFIG_REFDATA) return false;
+    if(deviceConfig.iCounter < 0) return false;
+    if(deviceConfig.lWaterContainerEmptyWeight < 0) return false;
+    if(deviceConfig.lWaterContainerFullWeight < 0) return false;
+    if(deviceConfig.iWaterMode < 0) return false;
+    if(deviceConfig.iWaterFillLowPerc < 0) return false;
+    if(deviceConfig.iWaterRecyclePerc < 0) return false;
+    if(deviceConfig.iWaterCheckCatPresence < 0) return false;
+    if(deviceConfig.iWaterDesiableAutoFill < 0) return false;
+    return true;
 }
 
 // *********************************************************************************************************************************************************************
@@ -302,6 +327,7 @@ void updateSensors(){
   if(lastIRValueCatDrinking==0 && val==1){
     lastIRValueCatDrinking=1;
     deviceSensors.isCatDrinking=1;
+    deviceSensors.lastCatDetectionTime = getDeviceTime();
     Serial.println("Cat is drinking");
   }
   
@@ -460,7 +486,17 @@ void setup() {
   Serial.begin(115200);           // start serial for output
 
   //EEPROM management
-  readConfig();
+  #if FORCE_EEPROM_REINITIALIZATION
+    Serial.println("FORCE_EEPROM_REINITIALIZATION enabled - resetting EEPROM config");
+    firstInitialization();
+  #else
+    readConfig();
+    if(!isInitialized()){
+        Serial.println("Config invalid or not initialized, resetting defaults");
+        firstInitialization();
+    }
+    readConfig();
+  #endif
   logConfig();
 
   //force re-initialize
@@ -472,10 +508,10 @@ void setup() {
 //  deviceConfig.iWaterFillLowPerc=20; //percentage below wich an alarm should be sent
 //  deviceConfig.refData=9999;
   
-  if(!isInitialized()){
+  //if(!isInitialized()){
       //initialize for the first time the EEPROM (or re-initialize);
-      firstInitialization();
-  }
+      //firstInitialization();
+  //}
 
   
   Wire.begin(deviceId);                // join i2c bus with address #8
